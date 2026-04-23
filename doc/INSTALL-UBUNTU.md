@@ -245,6 +245,74 @@ sudo ufw status
 
 ---
 
+## AI 콜봇 (pyVoIP) 연동
+
+### pjsip.conf — 콜봇 전용 엔드포인트
+
+pyVoIP 기반 콜봇이 다른 서브넷 또는 VPN에 위치할 경우 아래 설정이 필수다.
+
+```ini
+[2001]
+type=endpoint
+transport=transport-udp
+context=internal
+disallow=all
+allow=ulaw,alaw
+auth=auth2001
+aors=2001
+; RTP를 Asterisk가 항상 중계 — 콜봇이 다른 서브넷/VPN에 있으므로 direct media 불가
+direct_media=no
+; SIP Contact 주소를 실제 수신 IP:Port로 보정 (NAT/VPN 환경)
+force_rport=yes
+rewrite_contact=yes
+; rtp_symmetric=yes 금지: pyVoIP는 송수신 소켓을 분리(sin/sout)해서 사용함.
+; rtp_symmetric=yes 설정 시 Asterisk가 sout의 임의 포트로 RTP를 보내 sin이 수신 못 함.
+
+[auth2001]
+type=auth
+auth_type=userpass
+username=2001
+password=secret2001
+
+[2001]
+type=aor
+max_contacts=1
+remove_existing=yes
+```
+
+**핵심 설정 이유:**
+
+| 설정 | 값 | 이유 |
+|---|---|---|
+| `direct_media` | `no` | 콜봇이 VPN/다른 서브넷 — direct RTP 불가, Asterisk가 중계해야 함 |
+| `force_rport` | `yes` | NAT 뒤 콜봇의 실제 포트로 응답 전송 |
+| `rewrite_contact` | `yes` | SIP Contact 헤더를 수신된 IP:Port로 덮어써 라우팅 오류 방지 |
+| `rtp_symmetric` | (기본값 `no` 유지) | pyVoIP sin/sout 소켓 분리 구조 때문에 `yes`로 설정하면 RTP 수신 불가 |
+
+### extensions.conf — 콜봇 내선 추가
+
+```ini
+[internal]
+exten => 2001,1,Dial(PJSIP/2001,30)
+ same => n,Hangup()
+```
+
+### 방화벽 — 콜봇 RTP 포트 허용
+
+pyVoIP의 RTP 포트 범위를 좁게 설정해 방화벽 규칙을 명확히 관리한다.
+
+```bash
+# 콜봇 서버(172.31.90.1)의 RTP 포트 범위 허용
+sudo ufw allow from 172.31.90.1 to any port 16000:16100 proto udp
+```
+
+콜봇 실행 시 환경변수로 포트 범위를 지정한다:
+```bash
+RTP_PORT_LOW=16000 RTP_PORT_HIGH=16100 python main.py
+```
+
+---
+
 ## 트러블슈팅: 소프트폰 REGISTER 실패
 
 ### 1. 패킷이 서버에 도달하는지 확인
@@ -299,3 +367,102 @@ CLI에서 상태 변화 확인:
 tts-dev-001*CLI> pjsip show endpoints
 Endpoint:  1001    Available   0 of inf   ← Unavailable → Available
 ```
+
+---
+
+## 트러블슈팅: AI 콜봇 RTP 수신 불가 (STT 무음)
+
+### 증상
+
+TTS(콜봇 → 소프트폰) 는 정상이지만 STT(소프트폰 → 콜봇) 에 오디오가 수신되지 않는다.
+
+```
+[AudioSource] WARNING: No RTP audio received after 100 reads
+[AudioSource] Done: 0/1248 reads had audio
+```
+
+### 원인: pyVoIP 소켓 비대칭 구조 + NAT 핀홀
+
+pyVoIP는 RTP 송수신에 **별도 소켓**을 사용한다:
+
+- `sout` (송신 전용): TTS 재생 시 Asterisk로 오디오 전송 → 패킷을 먼저 보내므로 NAT 핀홀이 자동 개통됨
+- `sin` (수신 전용): STT를 위해 Asterisk로부터 오디오 수신 → **한 번도 패킷을 보내지 않으면 NAT 핀홀이 없어 수신 불가**
+
+Stateful NAT/방화벽 환경(VPN 포함)에서 `sin` 방향 핀홀은 `sin`이 먼저 패킷을 보내야만 열린다.
+
+### 해결: call.answer() 직후 sin 더미 패킷 전송
+
+```python
+call.answer()
+
+# sin 소켓에서 Asterisk RTP 포트로 더미 패킷 전송 → 핀홀 개통
+for rtp_client in call.RTPClients:
+    try:
+        rtp_client.sin.sendto(b'\x00', (rtp_client.outIP, rtp_client.outPort))
+    except Exception as e:
+        logger.warning(f"[RTP] Hole punch failed: {e}")
+```
+
+정상 동작 시 로그:
+```
+[RTP] Hole punch: sin(:16058) → 172.31.79.202:11520
+[AudioSource] First audio received (160 bytes) after 1 reads
+```
+
+### 진단: RTP 패킷 도달 여부 확인
+
+Asterisk 서버에서 tcpdump로 콜봇 방향 RTP 트래픽을 확인한다.
+
+```bash
+# Asterisk 서버에서 — 콜봇(172.31.90.1)으로 향하는 RTP 확인
+sudo tcpdump -i any -n "host 172.31.90.1 and udp portrange 16000-16100"
+```
+
+패킷이 없으면 방화벽/라우팅 문제, 패킷이 있지만 콜봇에서 수신 못 하면 NAT 핀홀 문제다.
+
+---
+
+## 트러블슈팅: Google STT 인식 실패 (VAD 오동작)
+
+### 증상 1 — transcript='timeout' (20초 대기 후 실패)
+
+```
+[STT] VAD: Speech BEGIN
+[STT] VAD: Speech END / EOS
+STT result: success=False, transcript='timeout'
+```
+
+**원인**: VAD END 이벤트 수신 시 `_stop = True`로 Google STT response 루프까지 즉시 종료했기 때문에 final transcript를 받지 못함.
+
+**해결**: VAD END 시 audio 전송만 중단하고 response 루프는 계속 유지해 Google STT가 final transcript를 반환할 때까지 대기한다. 스트림이 종료됐는데도 결과가 없으면 즉시 `non_voice` 처리한다(20초 timeout 방지).
+
+### 증상 2 — 실제 음성이 있는데 non_voice 처리
+
+```
+[AudioSource] Done: 401/549 reads had audio   ← 실제 음성 있음
+[STT] Stream ended without final result → non_voice
+```
+
+**원인**: VAD END 직후 `_audio_source.stop()`을 즉시 호출해 Google STT가 buffered audio를 처리하기 전에 스트림이 닫힘.
+
+**해결**: VAD END 후 즉시 스트림을 닫지 말고 ~500ms(4청크 × 125ms) 더 audio를 전송한 뒤 종료한다. Google STT가 남은 audio를 처리해 final transcript를 반환할 시간을 확보한다.
+
+```
+VAD END → 추가 4청크 전송(~500ms) → audio generator 종료
+       → Google STT final transcript 반환 → 결과 수신
+```
+
+### 증상 3 — VAD BEGIN/END 반복 후 지연 인식
+
+```
+[STT] VAD: Speech BEGIN
+[STT] VAD: Speech END / EOS
+[STT] VAD: Speech BEGIN     ← 반복
+[STT] VAD: Speech END / EOS
+... (n회)
+[STT] Final: '발화 내용'
+```
+
+**원인**: VAD END 이후 `_process_audio = False` 설정이 gRPC 스레드에 즉시 전파되지 않아 audio가 계속 전송됨.
+
+**해결**: `_audio_generator`에서 `_process_audio` 플래그를 직접 체크해 EOS flush 이후 루프를 명시적으로 종료한다.
